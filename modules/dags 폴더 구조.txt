@@ -1,0 +1,16 @@
+dags/
+│
+├── full_load.py
+│
+├── sources/
+│   ├── base.py
+│   ├── mysql.py
+│   ├── postgres.py
+│   └── oracle.py
+│
+├── common/
+│   ├── parquet.py
+│   └── snowflake.py
+│
+└── config/
+    └── sources.yaml

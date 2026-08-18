@@ -1,0 +1,19 @@
+sources:
+  - name: main_postgres
+    type: postgres
+    conn_id: postgres_db
+    schema: public
+    snowflake_schema: KJH
+
+sources:
+  - name: mysql_source
+    type: mysql
+    conn_id: mysql_db
+    schema: my_db
+    snowflake_schema: KJH
+#
+#  - name: erp_oracle
+#    type: oracle
+#    conn_id: oracle_erp
+#    schema: ERP_SCHEMA
+#    snowflake_schema: KJH
