@@ -10,16 +10,17 @@ from airflow.utils.task_group import TaskGroup
 from sources.postgres import PostgresAdapter
 from sources.mysql import MySQLAdapter
 from sources.oracle import OracleAdapter
+
 from common.parquet import export_to_parquet
 from common.snowflake import (
     quote_identifier,
-    qualified_table,
     create_tables,
     upload_to_stage,
     copy_into_and_swap,
     get_row_count,
     cleanup_stage_and_staging,
 )
+
 
 SNOWFLAKE_CONN_ID = "snowflake_conn"
 STAGE_NAME = "MY_STAGE"
@@ -33,7 +34,6 @@ DEFAULT_TASK_ARGS = {
 
 CONFIG_PATH = Path(__file__).parent / "config" / "sources.yaml"
 
-# 새 소스를 추가할 때: sources/새소스.py 만들고 여기 딕셔너리에 한 줄만 추가
 SOURCE_REGISTRY = {
     "postgres": PostgresAdapter,
     "mysql": MySQLAdapter,
@@ -47,7 +47,11 @@ def get_adapter(source_type: str, conn_id: str, schema: str):
             f"지원하지 않는 source_type: {source_type}. "
             f"사용 가능: {list(SOURCE_REGISTRY.keys())}"
         )
-    return SOURCE_REGISTRY[source_type](conn_id=conn_id, schema=schema)
+
+    return SOURCE_REGISTRY[source_type](
+        conn_id=conn_id,
+        schema=schema,
+    )
 
 
 def load_sources() -> list[dict]:
@@ -55,147 +59,265 @@ def load_sources() -> list[dict]:
         return yaml.safe_load(f)["sources"]
 
 
-def build_full_load_dag(source_cfg: dict):
-    """소스 설정 하나(dict)를 받아서 DAG 객체 하나를 생성해서 반환."""
+@dag(
+    dag_id="full_load",
+    start_date=datetime(2024, 1, 1),
+    schedule=None,
+    catchup=False,
+    max_active_tasks=5,
+    default_args=DEFAULT_TASK_ARGS,
+    tags=["full_load"],
+)
+def full_load():
+    # ============================================================
+    # source별 ETL pipeline을 생성하는 함수
+    # ============================================================
+    def build_source_pipeline(source_cfg: dict):
 
-    source_type = source_cfg["type"]
-    conn_id = source_cfg["conn_id"]
-    schema = source_cfg["schema"]
-    sf_schema = source_cfg["snowflake_schema"]
-    dag_id = f"full_load_{source_cfg['name']}"
+        source_name = source_cfg["name"]
+        source_type = source_cfg["type"]
+        conn_id = source_cfg["conn_id"]
+        schema = source_cfg["schema"]
+        sf_schema = source_cfg["snowflake_schema"]
 
-    @dag(
-        dag_id=dag_id,
-        start_date=datetime(2024, 1, 1),
-        schedule=None,
-        catchup=False,
-        max_active_tasks=5,
-        default_args=DEFAULT_TASK_ARGS,
-        tags=["full_load", source_type, source_cfg["name"]],
-    )
-    def _dag():
-
-        # -----------------------------
+        # --------------------------------------------------------
         # 1. TABLE LIST
-        # -----------------------------
-        @task
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_get_tables")
         def get_tables():
-            adapter = get_adapter(source_type, conn_id, schema)
+            adapter = get_adapter(
+                source_type,
+                conn_id,
+                schema,
+            )
+
             return adapter.get_tables()
 
-        # -----------------------------
-        # 2. CREATE TABLE (운영 + staging)
-        # -----------------------------
-        @task
+        # --------------------------------------------------------
+        # 2. CREATE TABLE
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_create_table")
         def create_table(table_name):
-            adapter = get_adapter(source_type, conn_id, schema)
+
+            adapter = get_adapter(
+                source_type,
+                conn_id,
+                schema,
+            )
+
             sf = SnowflakeHook(SNOWFLAKE_CONN_ID)
 
             cols = adapter.get_columns(table_name)
+
             if not cols:
-                raise ValueError(f"No columns found for table {table_name}")
+                raise ValueError(
+                    f"No columns found for table {table_name}"
+                )
 
             ddl = ", ".join(
-                f"{quote_identifier(col[0])} {adapter.map_type(col[1])}" for col in cols
+                f"{quote_identifier(col[0])} "
+                f"{adapter.map_type(col[1])}"
+                for col in cols
             )
-            staging_name = f"{table_name}_staging"
 
-            create_tables(sf, sf_schema, table_name, staging_name, ddl)
+            # source가 달라도 동일한 table_name이 존재할 수 있으므로
+            # Snowflake에서는 source_name을 포함하여 테이블 이름을 구분
+            target_table_name = f"{source_name}_{table_name}"
+            staging_name = f"{target_table_name}_staging"
+
+            create_tables(
+                sf,
+                sf_schema,
+                target_table_name,
+                staging_name,
+                ddl,
+            )
 
             col_names = [c[0] for c in cols]
-            return {"table_name": table_name, "columns": col_names}
 
-        # -----------------------------
-        # 3. EXPORT PARQUET (청크 단위)
-        # -----------------------------
-        @task
+            return {
+                "table_name": target_table_name,
+                "source_table_name": table_name,
+                "columns": col_names,
+            }
+
+        # --------------------------------------------------------
+        # 3. EXPORT PARQUET
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_export_parquet")
         def export_parquet(payload):
-            adapter = get_adapter(source_type, conn_id, schema)
+
+            adapter = get_adapter(
+                source_type,
+                conn_id,
+                schema,
+            )
 
             table_name = payload["table_name"]
+            source_table_name = payload["source_table_name"]
             col_names = payload["columns"]
 
             hook = adapter.get_hook()
             engine = hook.get_sqlalchemy_engine()
-            query = adapter.build_select_query(table_name)
 
-            file_path = f"{TMP_DIR}/{table_name}.parquet"
-            export_to_parquet(engine, query, col_names, file_path, CHUNK_SIZE)
+            query = adapter.build_select_query(
+                source_table_name
+            )
 
-            return {"table": table_name, "file": file_path}
+            file_path = (
+                f"{TMP_DIR}/"
+                f"{source_name}_"
+                f"{source_table_name}.parquet"
+            )
 
-        # -----------------------------
-        # 4. UPLOAD TO STAGE (소스 무관)
-        # -----------------------------
-        @task
+            export_to_parquet(
+                engine,
+                query,
+                col_names,
+                file_path,
+                CHUNK_SIZE,
+            )
+
+            return {
+                "table": table_name,
+                "source_table": source_table_name,
+                "file": file_path,
+            }
+
+        # --------------------------------------------------------
+        # 4. UPLOAD
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_upload")
         def upload(payload):
+
             sf = SnowflakeHook(SNOWFLAKE_CONN_ID)
-            upload_to_stage(sf, STAGE_NAME, payload["file"])
+
+            upload_to_stage(
+                sf,
+                STAGE_NAME,
+                payload["file"],
+            )
+
             return payload
 
-        # -----------------------------
-        # 5. COPY INTO STAGING -> SWAP (소스 무관)
-        # -----------------------------
-        @task
+        # --------------------------------------------------------
+        # 5. COPY INTO + SWAP
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_copy_into")
         def copy_into(payload):
+
             sf = SnowflakeHook(SNOWFLAKE_CONN_ID)
+
             table_name = payload["table"]
-            staging_name = f"{table_name}_staging"
-            copy_into_and_swap(sf, sf_schema, STAGE_NAME, table_name, staging_name)
-            return table_name
+            file_path = payload["file"]
 
-        # -----------------------------
+            staging_name = f"{table_name}_staging"
+            file_name = os.path.basename(file_path)
+
+            copy_into_and_swap(
+                sf,
+                sf_schema,
+                STAGE_NAME,
+                table_name,
+                staging_name,
+                file_name,
+            )
+
+            return {
+                "table": table_name,
+                "source_table": payload["source_table"],
+                "file": file_path,
+                "file_name": file_name,
+            }
+
+        # --------------------------------------------------------
         # 6. VALIDATE
-        # -----------------------------
-        @task
-        def validate(table_name):
-            adapter = get_adapter(source_type, conn_id, schema)
+        # --------------------------------------------------------
+        @task(task_id=f"{source_name}_validate")
+        def validate(payload):
+
+            adapter = get_adapter(
+                source_type,
+                conn_id,
+                schema,
+            )
+
             sf = SnowflakeHook(SNOWFLAKE_CONN_ID)
 
-            src_count = adapter.get_row_count(table_name)
-            sf_count = get_row_count(sf, sf_schema, table_name)
+            table_name = payload["table"]
+            source_table_name = payload["source_table"]
+
+            src_count = adapter.get_row_count(
+                source_table_name
+            )
+
+            sf_count = get_row_count(
+                sf,
+                sf_schema,
+                table_name,
+            )
 
             if src_count != sf_count:
-                raise ValueError(f"{table_name} mismatch: SRC={src_count}, SF={sf_count}")
+                raise ValueError(
+                    f"{source_name}.{source_table_name} mismatch: "
+                    f"SRC={src_count}, "
+                    f"SF={sf_count}"
+                )
 
-            return table_name
+            return payload
 
-        # -----------------------------
-        # 7. CLEANUP (항상 실행, 소스 무관)
-        # -----------------------------
-        @task(trigger_rule="all_done")
-        def cleanup(table_name):
+        # --------------------------------------------------------
+        # 7. CLEANUP
+        # --------------------------------------------------------
+        @task(
+            task_id=f"{source_name}_cleanup",
+            trigger_rule="all_done",
+        )
+        def cleanup(payload):
+
             sf = SnowflakeHook(SNOWFLAKE_CONN_ID)
+
+            table_name = payload["table"]
+            file_path = payload["file"]
+            file_name = payload["file_name"]
+
             staging_name = f"{table_name}_staging"
 
-            cleanup_stage_and_staging(sf, sf_schema, STAGE_NAME, table_name, staging_name)
+            cleanup_stage_and_staging(
+                sf,
+                sf_schema,
+                STAGE_NAME,
+                table_name,
+                staging_name,
+                file_name,
+            )
 
-            local_file = f"{TMP_DIR}/{table_name}.parquet"
-            if os.path.exists(local_file):
-                os.remove(local_file)
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
             return f"{table_name} cleaned"
 
-        # -----------------------------
+        # --------------------------------------------------------
         # FLOW
-        # -----------------------------
+        # --------------------------------------------------------
         tables = get_tables()
 
-        with TaskGroup("etl_pipeline"):
+        with TaskGroup(group_id=f"{source_name}_etl_pipeline"):
             t1 = create_table.expand(table_name=tables)
             t2 = export_parquet.expand(payload=t1)
             t3 = upload.expand(payload=t2)
             t4 = copy_into.expand(payload=t3)
-            t5 = validate.expand(table_name=t4)
-            cleanup.expand(table_name=t5)
+            t5 = validate.expand(payload=t4)
+            cleanup.expand(payload=t5)
 
-    return _dag()
+    # ============================================================
+    # YAML에 등록된 모든 source에 대해 pipeline 생성
+    # ============================================================
+    for source_cfg in load_sources():
+        build_source_pipeline(source_cfg)
 
 
-# -----------------------------
-# YAML의 소스 개수만큼 DAG를 실제로 생성해서 전역 네임스페이스에 등록
-# Airflow는 모듈의 전역 변수를 스캔해서 DAG 객체를 찾습니다.
-# -----------------------------
-for _source_cfg in load_sources():
-    _dag_id = f"full_load_{_source_cfg['name']}"
-    globals()[_dag_id] = build_full_load_dag(_source_cfg)
+# ================================================================
+# DAG 등록
+# ================================================================
+full_load()
